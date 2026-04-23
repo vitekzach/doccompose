@@ -76,7 +76,7 @@ func stopServiceCmd(client docker.Client, composePath, service string) tea.Cmd {
 }
 
 func pollTickCmd() tea.Cmd {
-	return tea.Tick(5*time.Second, func(time.Time) tea.Msg {
+	return tea.Tick(1*time.Second, func(time.Time) tea.Msg {
 		return pollTickMsg{}
 	})
 }
@@ -125,6 +125,18 @@ var (
 
 	busyStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("220"))
+
+	btnStartStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("0")).
+			Background(lipgloss.Color("78")).
+			Padding(0, 1).
+			Bold(true)
+
+	btnStopStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("0")).
+			Background(lipgloss.Color("196")).
+			Padding(0, 1).
+			Bold(true)
 )
 
 type Model struct {
@@ -249,6 +261,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				row.busyMsg = "stopping"
 				return m, stopServiceCmd(m.client, m.composePath, row.name)
 			}
+		case "s":
+			var cmds []tea.Cmd
+			for i := range m.rows {
+				if !m.rows[i].busy && m.rows[i].desired != DesiredRunning {
+					m.rows[i].desired = DesiredRunning
+					m.rows[i].busy = true
+					m.rows[i].busyMsg = "starting"
+					cmds = append(cmds, startServiceCmd(m.client, m.composePath, m.rows[i].name))
+				}
+			}
+			if len(cmds) > 0 {
+				return m, tea.Batch(cmds...)
+			}
+		case "x":
+			var cmds []tea.Cmd
+			for i := range m.rows {
+				if !m.rows[i].busy && m.rows[i].desired != DesiredStopped {
+					m.rows[i].desired = DesiredStopped
+					m.rows[i].busy = true
+					m.rows[i].busyMsg = "stopping"
+					cmds = append(cmds, stopServiceCmd(m.client, m.composePath, m.rows[i].name))
+				}
+			}
+			if len(cmds) > 0 {
+				return m, tea.Batch(cmds...)
+			}
 		}
 	}
 
@@ -312,12 +350,16 @@ func (m Model) View() string {
 	}
 
 	b.WriteString("\n")
+	b.WriteString(btnStartStyle.Render("▶ Start All (s)"))
+	b.WriteString("  ")
+	b.WriteString(btnStopStyle.Render("■ Stop All (x)"))
+	b.WriteString("\n\n")
 
 	if m.lastErr != "" {
 		b.WriteString(errorStyle.Render("error: "+m.lastErr) + "\n")
 	}
 
-	b.WriteString(helpStyle.Render("↑/↓ navigate  •  space start/stop  •  q quit"))
+	b.WriteString(helpStyle.Render("↑/↓ navigate  •  space toggle  •  s start all  •  x stop all  •  q quit"))
 
 	return b.String()
 }
