@@ -5,31 +5,42 @@ import (
 	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/vitekzach/doccompose/compose"
+	"github.com/vitekzach/doccompose/ui"
 )
 
-type model struct{}
-
-func (m model) Init() tea.Cmd {
-	return nil
+var candidatePaths = []string{
+	"compose.yaml",
+	"compose.yml",
+	"docker-compose.yaml",
+	"docker-compose.yml",
 }
 
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg := msg.(type) {
-	case tea.KeyMsg:
-		switch msg.String() {
-		case "q", "ctrl+c":
-			return m, tea.Quit
+func findComposeFile() (string, error) {
+	for _, path := range candidatePaths {
+		if _, err := os.Stat(path); err == nil {
+			return path, nil
 		}
 	}
-	return m, nil
-}
-
-func (m model) View() string {
-	return "doccompose - press q to quit\n"
+	return "", fmt.Errorf(
+		"no compose file found in current directory\nlooked for: compose.yaml, compose.yml, docker-compose.yaml, docker-compose.yml",
+	)
 }
 
 func main() {
-	p := tea.NewProgram(model{})
+	path, err := findComposeFile()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+
+	composeFile, err := compose.ParseFile(path)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "error parsing compose file:", err)
+		os.Exit(1)
+	}
+
+	p := tea.NewProgram(ui.New(path, composeFile), tea.WithAltScreen())
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
