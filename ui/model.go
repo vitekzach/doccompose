@@ -2,6 +2,8 @@ package ui
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -286,6 +288,7 @@ const (
 
 type Model struct {
 	composePath  string
+	dirName      string
 	client       docker.Client
 	rows         []serviceRow
 	cursor       int
@@ -323,8 +326,12 @@ func New(composePath string, composeFile *compose.File, client docker.Client) Mo
 
 	vp := viewport.New(0, minLogHeight)
 
+	cwd, _ := os.Getwd()
+	dirName := filepath.Base(cwd)
+
 	return Model{
 		composePath: composePath,
+		dirName:     dirName,
 		client:      client,
 		rows:        rows,
 		spinner:     sp,
@@ -414,6 +421,7 @@ func (m Model) renderLogBox() string {
 
 func (m Model) Init() tea.Cmd {
 	return tea.Batch(
+		tea.SetWindowTitle("doccompose — "+m.dirName),
 		fetchStatusesCmd(m.client, m.composePath),
 		pollTickCmd(),
 		m.spinner.Tick,
@@ -640,10 +648,17 @@ func (m Model) View() string {
 	var b strings.Builder
 
 	if !m.hideTop {
-		// header
-		b.WriteString(titleStyle.Render("doccompose"))
-		b.WriteString("  ")
-		b.WriteString(subtitleStyle.Render(fmt.Sprintf("%s  •  %d services", m.composePath, len(m.rows))))
+		// header — centered across terminal width
+		sep := subtitleStyle.Render("  •  ")
+		header := titleStyle.Render("doccompose") +
+			sep + titleStyle.Render(m.dirName) +
+			sep + subtitleStyle.Render(m.composePath) +
+			sep + subtitleStyle.Render(fmt.Sprintf("%d services", len(m.rows)))
+		w := m.width
+		if w <= 0 {
+			w = 80
+		}
+		b.WriteString(lipgloss.NewStyle().Width(w).Align(lipgloss.Center).Render(header))
 		b.WriteString("\n\n")
 
 		// service list
