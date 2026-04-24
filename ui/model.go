@@ -102,6 +102,19 @@ type logFollowerDoneMsg struct{}
 
 type restartLogFollowerMsg struct{}
 
+type buildStartedMsg struct {
+	lineCh  <-chan string
+	errCh   <-chan error
+	service string // empty = build all
+}
+
+type buildLineMsg string
+
+type buildDoneMsg struct {
+	service string
+	err     error
+}
+
 // commands
 
 func fetchStatusesCmd(client docker.Client, composePath string) tea.Cmd {
@@ -143,6 +156,26 @@ func pollTickCmd() tea.Cmd {
 	return tea.Tick(1*time.Second, func(time.Time) tea.Msg {
 		return pollTickMsg{}
 	})
+}
+
+func buildCmd(client docker.Client, composePath, service string) tea.Cmd {
+	return func() tea.Msg {
+		lineCh, errCh, err := client.StreamBuild(composePath, service)
+		if err != nil {
+			return buildDoneMsg{service: service, err: err}
+		}
+		return buildStartedMsg{lineCh: lineCh, errCh: errCh, service: service}
+	}
+}
+
+func waitForBuildLine(lineCh <-chan string, errCh <-chan error, service string) tea.Cmd {
+	return func() tea.Msg {
+		line, ok := <-lineCh
+		if !ok {
+			return buildDoneMsg{service: service, err: <-errCh}
+		}
+		return buildLineMsg(line)
+	}
 }
 
 func startLogFollowerCmd(client docker.Client, composePath string) tea.Cmd {
@@ -222,6 +255,12 @@ var (
 			Padding(0, 1).
 			Bold(true)
 
+	btnBuildStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("0")).
+			Background(lipgloss.Color("214")).
+			Padding(0, 1).
+			Bold(true)
+
 	logBorderStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("238"))
 
@@ -246,17 +285,21 @@ const (
 )
 
 type Model struct {
-	composePath string
-	client      docker.Client
-	rows        []serviceRow
-	cursor      int
-	spinner     spinner.Model
-	log         viewport.Model
-	logLines    []string
-	logCh       <-chan string
-	lastErr     string
-	width       int
-	height      int
+	composePath  string
+	client       docker.Client
+	rows         []serviceRow
+	cursor       int
+	spinner      spinner.Model
+	log          viewport.Model
+	logLines     []string
+	logCh        <-chan string
+	buildLineCh  <-chan string
+	buildErrCh   <-chan error
+	buildService string
+	lastErr      string
+	hideTop      bool
+	width        int
+	height       int
 }
 
 func New(composePath string, composeFile *compose.File, client docker.Client) Model {
@@ -316,8 +359,13 @@ func (m *Model) resizeLog() {
 	if m.width == 0 || m.height == 0 {
 		return
 	}
-	listHeight := len(m.rows) + 1
-	available := m.height - fixedLines - listHeight
+	var available int
+	if m.hideTop {
+		// only the log box borders (top+bottom) and the blank line after remain
+		available = m.height - 3
+	} else {
+		available = m.height - fixedLines - len(m.rows) - 1
+	}
 	logH := available
 	if logH < minLogHeight {
 		logH = minLogHeight
@@ -468,6 +516,49 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, fetchStatusesCmd(m.client, m.composePath)
 
+	case buildStartedMsg:
+		m.buildLineCh = msg.lineCh
+		m.buildErrCh = msg.errCh
+		m.buildService = msg.service
+		label := msg.service
+		if label == "" {
+			label = "all"
+		}
+		m.appendLogLines(logSeparatorStyle.Render(fmt.Sprintf("── building %s ──", label)))
+		return m, waitForBuildLine(m.buildLineCh, m.buildErrCh, m.buildService)
+
+	case buildLineMsg:
+		m.appendLogLines(string(msg))
+		return m, waitForBuildLine(m.buildLineCh, m.buildErrCh, m.buildService)
+
+	case buildDoneMsg:
+		m.buildLineCh = nil
+		m.buildErrCh = nil
+		if msg.service == "" {
+			for i := range m.rows {
+				if m.rows[i].busyMsg == "building" {
+					m.rows[i].busy = false
+					m.rows[i].busyMsg = ""
+				}
+			}
+		} else {
+			for i := range m.rows {
+				if m.rows[i].name == msg.service {
+					m.rows[i].busy = false
+					m.rows[i].busyMsg = ""
+					break
+				}
+			}
+		}
+		if msg.err != nil {
+			m.lastErr = fmt.Sprintf("build: %s", msg.err)
+			m.appendLogLines(logSeparatorStyle.Render(fmt.Sprintf("── build failed: %s ──", msg.err)))
+		} else {
+			m.lastErr = ""
+			m.appendLogLines(logSeparatorStyle.Render("── build complete ──"))
+		}
+		return m, fetchStatusesCmd(m.client, m.composePath)
+
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "q", "ctrl+c":
@@ -484,6 +575,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.log.HalfViewUp()
 		case "pgdown":
 			m.log.HalfViewDown()
+		case "h":
+			m.hideTop = !m.hideTop
+			m.resizeLog()
 		case "G", "end":
 			m.log.GotoBottom()
 		case " ":
@@ -514,6 +608,28 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.rows[i].busyMsg = "stopping"
 			}
 			return m, downCmd(m.client, m.composePath)
+		case "b":
+			if m.buildLineCh != nil {
+				break
+			}
+			row := &m.rows[m.cursor]
+			if row.busy {
+				break
+			}
+			row.busy = true
+			row.busyMsg = "building"
+			return m, buildCmd(m.client, m.composePath, row.name)
+		case "B":
+			if m.buildLineCh != nil {
+				break
+			}
+			for i := range m.rows {
+				if m.rows[i].service.Build != nil {
+					m.rows[i].busy = true
+					m.rows[i].busyMsg = "building"
+				}
+			}
+			return m, buildCmd(m.client, m.composePath, "")
 		}
 	}
 
@@ -523,64 +639,68 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 func (m Model) View() string {
 	var b strings.Builder
 
-	// header
-	b.WriteString(titleStyle.Render("doccompose"))
-	b.WriteString("  ")
-	b.WriteString(subtitleStyle.Render(fmt.Sprintf("%s  •  %d services", m.composePath, len(m.rows))))
-	b.WriteString("\n\n")
-
-	// service list
-	for i, row := range m.rows {
-		cursor := "  "
-		if i == m.cursor {
-			cursor = cursorStyle.Render("▶ ")
-		}
-
-		check := checkOffStyle.Render("[ ]")
-		if row.desired == DesiredRunning {
-			check = checkOnStyle.Render("[✓]")
-		}
-
-		var svcName string
-		if i == m.cursor {
-			svcName = nameCursorStyle.Render(row.name)
-		} else {
-			svcName = nameStyle.Render(row.name)
-		}
-
-		var source string
-		if row.service.Image != "" {
-			source = dimStyle.Render("image: " + row.service.Image)
-		} else if row.service.Build != nil && row.service.Build.Context != "" {
-			source = dimStyle.Render("build: " + row.service.Build.Context)
-		}
-
-		var status string
-		if row.busy {
-			status = busyStyle.Render(m.spinner.View() + row.busyMsg)
-		} else if row.actual == ActualRunning {
-			status = runningStyle.Render("● running")
-		} else {
-			status = stoppedStyle.Render("○ stopped")
-		}
-
-		b.WriteString(cursor)
-		b.WriteString(check)
+	if !m.hideTop {
+		// header
+		b.WriteString(titleStyle.Render("doccompose"))
 		b.WriteString("  ")
-		b.WriteString(colNameStyle.Render(svcName))
+		b.WriteString(subtitleStyle.Render(fmt.Sprintf("%s  •  %d services", m.composePath, len(m.rows))))
+		b.WriteString("\n\n")
+
+		// service list
+		for i, row := range m.rows {
+			cursor := "  "
+			if i == m.cursor {
+				cursor = cursorStyle.Render("▶ ")
+			}
+
+			check := checkOffStyle.Render("[ ]")
+			if row.desired == DesiredRunning {
+				check = checkOnStyle.Render("[✓]")
+			}
+
+			var svcName string
+			if i == m.cursor {
+				svcName = nameCursorStyle.Render(row.name)
+			} else {
+				svcName = nameStyle.Render(row.name)
+			}
+
+			var source string
+			if row.service.Image != "" {
+				source = dimStyle.Render("image: " + row.service.Image)
+			} else if row.service.Build != nil && row.service.Build.Context != "" {
+				source = dimStyle.Render("build: " + row.service.Build.Context)
+			}
+
+			var status string
+			if row.busy {
+				status = busyStyle.Render(m.spinner.View() + row.busyMsg)
+			} else if row.actual == ActualRunning {
+				status = runningStyle.Render("● running")
+			} else {
+				status = stoppedStyle.Render("○ stopped")
+			}
+
+			b.WriteString(cursor)
+			b.WriteString(check)
+			b.WriteString("  ")
+			b.WriteString(colNameStyle.Render(svcName))
+			b.WriteString("  ")
+			b.WriteString(colSourceStyle.Render(source))
+			b.WriteString("  ")
+			b.WriteString(colStatusStyle.Render(status))
+			b.WriteString("\n")
+		}
+
+		// buttons
+		b.WriteString("\n")
+		b.WriteString(btnStartStyle.Render("▶ Start All (s)"))
 		b.WriteString("  ")
-		b.WriteString(colSourceStyle.Render(source))
+		b.WriteString(btnStopStyle.Render("■ Stop All (x)"))
 		b.WriteString("  ")
-		b.WriteString(colStatusStyle.Render(status))
+		b.WriteString(btnBuildStyle.Render("⚙ Build All (B)"))
 		b.WriteString("\n")
 	}
-
-	// buttons
-	b.WriteString("\n")
-	b.WriteString(btnStartStyle.Render("▶ Start All (s)"))
-	b.WriteString("  ")
-	b.WriteString(btnStopStyle.Render("■ Stop All (x)"))
-	b.WriteString("\n")
 
 	// log box
 	b.WriteString(m.renderLogBox())
@@ -591,7 +711,7 @@ func (m Model) View() string {
 		b.WriteString(errorStyle.Render("error: " + m.lastErr))
 		b.WriteString("\n")
 	}
-	b.WriteString(helpStyle.Render("↑/↓ navigate  •  space toggle  •  s start all  •  x stop all  •  pgup/pgdn scroll  •  G end  •  q quit"))
+	b.WriteString(helpStyle.Render("↑/↓ navigate  •  space toggle  •  s start all  •  x stop all  •  b build  •  B build all  •  pgup/pgdn scroll  •  G end  •  h toggle panel  •  q quit"))
 
 	return b.String()
 }

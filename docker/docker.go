@@ -165,3 +165,46 @@ func (c Client) UpAll(composePath string) (string, error) {
 	}
 	return output, nil
 }
+
+// StreamBuild runs `<bin> compose build [service]` and streams output lines
+// into the returned channel. Pass an empty service to build all services.
+// The second channel receives the exit error (nil on success) exactly once,
+// just before the line channel is closed.
+func (c Client) StreamBuild(composePath, service string) (<-chan string, <-chan error, error) {
+	args := []string{"compose", "-f", composePath, "build"}
+	if service != "" {
+		args = append(args, service)
+	}
+
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, nil, err
+	}
+
+	cmd := exec.Command(c.bin, args...)
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	if err := cmd.Start(); err != nil {
+		pr.Close()
+		pw.Close()
+		return nil, nil, err
+	}
+	pw.Close()
+
+	linesCh := make(chan string, 256)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(linesCh)
+		defer pr.Close()
+		scanner := bufio.NewScanner(pr)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			linesCh <- scanner.Text()
+		}
+		errCh <- cmd.Wait()
+		close(errCh)
+	}()
+
+	return linesCh, errCh, nil
+}
