@@ -7,11 +7,40 @@ import (
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
+	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/vitekzach/doccompose/compose"
 	"github.com/vitekzach/doccompose/docker"
 )
+
+var logPalette = []lipgloss.Color{
+	"39", "118", "214", "171", "51", "196", "226", "213", "82", "45",
+}
+
+func serviceColor(name string) lipgloss.Color {
+	h := 0
+	for _, c := range name {
+		h = h*31 + int(c)
+	}
+	if h < 0 {
+		h = -h
+	}
+	return logPalette[h%len(logPalette)]
+}
+
+// colorizeLogLine detects the "service  | message" prefix emitted by compose
+// logs and applies a deterministic per-service color to the prefix.
+func colorizeLogLine(line string) string {
+	idx := strings.Index(line, " | ")
+	if idx < 0 {
+		return line
+	}
+	prefix := line[:idx]
+	rest := line[idx:]
+	color := serviceColor(strings.TrimSpace(prefix))
+	return lipgloss.NewStyle().Foreground(color).Bold(true).Render(prefix) + rest
+}
 
 // ActualState is the live running state reported by Docker.
 type ActualState int
@@ -47,10 +76,31 @@ type statusesMsg struct {
 
 type actionDoneMsg struct {
 	service string
+	output  string
 	err     error
 }
 
+type downDoneMsg struct {
+	output string
+	err    error
+}
+
+type upAllDoneMsg struct {
+	output string
+	err    error
+}
+
 type pollTickMsg struct{}
+
+type logLineMsg string
+
+type logFollowerStartedMsg struct {
+	ch <-chan string
+}
+
+type logFollowerDoneMsg struct{}
+
+type restartLogFollowerMsg struct{}
 
 // commands
 
@@ -63,15 +113,29 @@ func fetchStatusesCmd(client docker.Client, composePath string) tea.Cmd {
 
 func startServiceCmd(client docker.Client, composePath, service string) tea.Cmd {
 	return func() tea.Msg {
-		err := client.Start(composePath, service)
-		return actionDoneMsg{service: service, err: err}
+		output, err := client.Start(composePath, service)
+		return actionDoneMsg{service: service, output: output, err: err}
 	}
 }
 
 func stopServiceCmd(client docker.Client, composePath, service string) tea.Cmd {
 	return func() tea.Msg {
-		err := client.Stop(composePath, service)
-		return actionDoneMsg{service: service, err: err}
+		output, err := client.Stop(composePath, service)
+		return actionDoneMsg{service: service, output: output, err: err}
+	}
+}
+
+func downCmd(client docker.Client, composePath string) tea.Cmd {
+	return func() tea.Msg {
+		output, err := client.Down(composePath)
+		return downDoneMsg{output: output, err: err}
+	}
+}
+
+func upAllCmd(client docker.Client, composePath string) tea.Cmd {
+	return func() tea.Msg {
+		output, err := client.UpAll(composePath)
+		return upAllDoneMsg{output: output, err: err}
 	}
 }
 
@@ -79,6 +143,26 @@ func pollTickCmd() tea.Cmd {
 	return tea.Tick(1*time.Second, func(time.Time) tea.Msg {
 		return pollTickMsg{}
 	})
+}
+
+func startLogFollowerCmd(client docker.Client, composePath string) tea.Cmd {
+	return func() tea.Msg {
+		ch, err := client.FollowLogs(composePath)
+		if err != nil {
+			return logFollowerDoneMsg{} // will retry
+		}
+		return logFollowerStartedMsg{ch: ch}
+	}
+}
+
+func waitForLogLine(ch <-chan string) tea.Cmd {
+	return func() tea.Msg {
+		line, ok := <-ch
+		if !ok {
+			return logFollowerDoneMsg{}
+		}
+		return logLineMsg(line)
+	}
 }
 
 // styles
@@ -137,6 +221,28 @@ var (
 			Background(lipgloss.Color("196")).
 			Padding(0, 1).
 			Bold(true)
+
+	logBorderStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("238"))
+
+	logTitleStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("205")).
+			Bold(true)
+
+	logSeparatorStyle = lipgloss.NewStyle().
+				Foreground(lipgloss.Color("238"))
+
+	colNameStyle   = lipgloss.NewStyle().Width(24)
+	colSourceStyle = lipgloss.NewStyle().Width(34)
+	colStatusStyle = lipgloss.NewStyle().Width(12)
+)
+
+const (
+	// fixed lines outside the log viewport:
+	// title+gap(2) + gap+buttons(2) + box borders(2) + blank after box(1) = 7; help has no trailing newline
+	fixedLines   = 7
+	minLogHeight = 3
+	maxLogLines  = 2000
 )
 
 type Model struct {
@@ -145,6 +251,9 @@ type Model struct {
 	rows        []serviceRow
 	cursor      int
 	spinner     spinner.Model
+	log         viewport.Model
+	logLines    []string
+	logCh       <-chan string
 	lastErr     string
 	width       int
 	height      int
@@ -169,12 +278,90 @@ func New(composePath string, composeFile *compose.File, client docker.Client) Mo
 	sp.Spinner = spinner.Dot
 	sp.Style = busyStyle
 
+	vp := viewport.New(0, minLogHeight)
+
 	return Model{
 		composePath: composePath,
 		client:      client,
 		rows:        rows,
 		spinner:     sp,
+		log:         vp,
 	}
+}
+
+func (m *Model) appendLogLines(lines ...string) {
+	atBottom := m.log.AtBottom()
+	m.logLines = append(m.logLines, lines...)
+	if len(m.logLines) > maxLogLines {
+		m.logLines = m.logLines[len(m.logLines)-maxLogLines:]
+		m.logLines[0] = logSeparatorStyle.Render(fmt.Sprintf("── (oldest lines dropped, showing last %d) ──", maxLogLines))
+	}
+	m.log.SetContent(strings.Join(m.logLines, "\n"))
+	if atBottom {
+		m.log.GotoBottom()
+	}
+}
+
+// appendCommandOutput adds a labelled block of command output to the log.
+func (m *Model) appendCommandOutput(label, output string) {
+	sep := logSeparatorStyle.Render(fmt.Sprintf("── %s %s", label, strings.Repeat("─", max(0, 40-len(label)))))
+	lines := []string{sep}
+	if output != "" {
+		lines = append(lines, strings.Split(output, "\n")...)
+	}
+	m.appendLogLines(lines...)
+}
+
+func (m *Model) resizeLog() {
+	if m.width == 0 || m.height == 0 {
+		return
+	}
+	listHeight := len(m.rows) + 1
+	available := m.height - fixedLines - listHeight
+	logH := available
+	if logH < minLogHeight {
+		logH = minLogHeight
+	}
+	m.log.Width = m.width - 4 // 1 border + 1 space on each side
+	m.log.Height = logH
+}
+
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (m Model) renderLogBox() string {
+	w := m.width
+	if w <= 0 {
+		w = 60
+	}
+	bd := logBorderStyle
+	title := logTitleStyle.Render(" LOGS ")
+	tw := lipgloss.Width(title)
+	iw := w - 2 // chars between ╭ and ╮
+
+	// ╭─ LOGS ──────╮
+	rightDashes := iw - 1 - tw // 1 dash + space before title already counted in "─ "
+	if rightDashes < 0 {
+		rightDashes = 0
+	}
+	top := bd.Render("╭─") + title + bd.Render(strings.Repeat("─", rightDashes)+"╮")
+
+	// │ <content> │
+	cw := m.log.Width
+	var mid strings.Builder
+	for _, line := range strings.Split(m.log.View(), "\n") {
+		pad := max(0, cw-lipgloss.Width(line))
+		mid.WriteString(bd.Render("│") + " " + line + strings.Repeat(" ", pad) + " " + bd.Render("│") + "\n")
+	}
+
+	// ╰─────────────╯
+	bottom := bd.Render("╰" + strings.Repeat("─", iw) + "╯")
+
+	return top + "\n" + mid.String() + bottom
 }
 
 func (m Model) Init() tea.Cmd {
@@ -182,6 +369,7 @@ func (m Model) Init() tea.Cmd {
 		fetchStatusesCmd(m.client, m.composePath),
 		pollTickCmd(),
 		m.spinner.Tick,
+		startLogFollowerCmd(m.client, m.composePath),
 	)
 }
 
@@ -191,6 +379,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.resizeLog()
 
 	case spinner.TickMsg:
 		var cmd tea.Cmd
@@ -200,12 +389,29 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case pollTickMsg:
 		return m, tea.Batch(fetchStatusesCmd(m.client, m.composePath), pollTickCmd())
 
+	case logFollowerStartedMsg:
+		m.logCh = msg.ch
+		return m, waitForLogLine(m.logCh)
+
+	case logLineMsg:
+		m.appendLogLines(colorizeLogLine(string(msg)))
+		return m, waitForLogLine(m.logCh)
+
+	case logFollowerDoneMsg:
+		// follower process exited; restart after a short delay so we
+		// re-attach once containers come back up
+		return m, tea.Tick(2*time.Second, func(time.Time) tea.Msg {
+			return restartLogFollowerMsg{}
+		})
+
+	case restartLogFollowerMsg:
+		return m, startLogFollowerCmd(m.client, m.composePath)
+
 	case statusesMsg:
 		if msg.err != nil {
 			m.lastErr = msg.err.Error()
 			return m, nil
 		}
-		m.lastErr = ""
 		for i := range m.rows {
 			if running, ok := msg.statuses[m.rows[i].name]; ok {
 				if running {
@@ -218,6 +424,34 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 
+	case upAllDoneMsg:
+		for i := range m.rows {
+			m.rows[i].busy = false
+			m.rows[i].busyMsg = ""
+			m.rows[i].desired = DesiredRunning
+		}
+		m.appendCommandOutput("compose up -d", msg.output)
+		if msg.err != nil {
+			m.lastErr = msg.err.Error()
+		} else {
+			m.lastErr = ""
+		}
+		return m, fetchStatusesCmd(m.client, m.composePath)
+
+	case downDoneMsg:
+		for i := range m.rows {
+			m.rows[i].busy = false
+			m.rows[i].busyMsg = ""
+			m.rows[i].desired = DesiredStopped
+		}
+		m.appendCommandOutput("compose down", msg.output)
+		if msg.err != nil {
+			m.lastErr = msg.err.Error()
+		} else {
+			m.lastErr = ""
+		}
+		return m, fetchStatusesCmd(m.client, m.composePath)
+
 	case actionDoneMsg:
 		for i := range m.rows {
 			if m.rows[i].name == msg.service {
@@ -226,6 +460,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 		}
+		m.appendCommandOutput(msg.service, msg.output)
 		if msg.err != nil {
 			m.lastErr = fmt.Sprintf("%s: %s", msg.service, msg.err)
 		} else {
@@ -245,6 +480,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.rows)-1 {
 				m.cursor++
 			}
+		case "pgup":
+			m.log.HalfViewUp()
+		case "pgdown":
+			m.log.HalfViewDown()
+		case "G", "end":
+			m.log.GotoBottom()
 		case " ":
 			row := &m.rows[m.cursor]
 			if row.busy {
@@ -262,54 +503,33 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, stopServiceCmd(m.client, m.composePath, row.name)
 			}
 		case "s":
-			var cmds []tea.Cmd
 			for i := range m.rows {
-				if !m.rows[i].busy && m.rows[i].desired != DesiredRunning {
-					m.rows[i].desired = DesiredRunning
-					m.rows[i].busy = true
-					m.rows[i].busyMsg = "starting"
-					cmds = append(cmds, startServiceCmd(m.client, m.composePath, m.rows[i].name))
-				}
+				m.rows[i].busy = true
+				m.rows[i].busyMsg = "starting"
 			}
-			if len(cmds) > 0 {
-				return m, tea.Batch(cmds...)
-			}
+			return m, upAllCmd(m.client, m.composePath)
 		case "x":
-			var cmds []tea.Cmd
 			for i := range m.rows {
-				if !m.rows[i].busy && m.rows[i].desired != DesiredStopped {
-					m.rows[i].desired = DesiredStopped
-					m.rows[i].busy = true
-					m.rows[i].busyMsg = "stopping"
-					cmds = append(cmds, stopServiceCmd(m.client, m.composePath, m.rows[i].name))
-				}
+				m.rows[i].busy = true
+				m.rows[i].busyMsg = "stopping"
 			}
-			if len(cmds) > 0 {
-				return m, tea.Batch(cmds...)
-			}
+			return m, downCmd(m.client, m.composePath)
 		}
 	}
 
 	return m, nil
 }
 
-func (m Model) anyBusy() bool {
-	for _, r := range m.rows {
-		if r.busy {
-			return true
-		}
-	}
-	return false
-}
-
 func (m Model) View() string {
 	var b strings.Builder
 
+	// header
 	b.WriteString(titleStyle.Render("doccompose"))
 	b.WriteString("  ")
 	b.WriteString(subtitleStyle.Render(fmt.Sprintf("%s  •  %d services", m.composePath, len(m.rows))))
 	b.WriteString("\n\n")
 
+	// service list
 	for i, row := range m.rows {
 		cursor := "  "
 		if i == m.cursor {
@@ -344,22 +564,34 @@ func (m Model) View() string {
 			status = stoppedStyle.Render("○ stopped")
 		}
 
-		b.WriteString(fmt.Sprintf("%s%s  %-28s  %-30s  %s\n",
-			cursor, check, svcName, source, status,
-		))
+		b.WriteString(cursor)
+		b.WriteString(check)
+		b.WriteString("  ")
+		b.WriteString(colNameStyle.Render(svcName))
+		b.WriteString("  ")
+		b.WriteString(colSourceStyle.Render(source))
+		b.WriteString("  ")
+		b.WriteString(colStatusStyle.Render(status))
+		b.WriteString("\n")
 	}
 
+	// buttons
 	b.WriteString("\n")
 	b.WriteString(btnStartStyle.Render("▶ Start All (s)"))
 	b.WriteString("  ")
 	b.WriteString(btnStopStyle.Render("■ Stop All (x)"))
-	b.WriteString("\n\n")
+	b.WriteString("\n")
 
+	// log box
+	b.WriteString(m.renderLogBox())
+	b.WriteString("\n")
+
+	// error + help
 	if m.lastErr != "" {
-		b.WriteString(errorStyle.Render("error: "+m.lastErr) + "\n")
+		b.WriteString(errorStyle.Render("error: " + m.lastErr))
+		b.WriteString("\n")
 	}
-
-	b.WriteString(helpStyle.Render("↑/↓ navigate  •  space toggle  •  s start all  •  x stop all  •  q quit"))
+	b.WriteString(helpStyle.Render("↑/↓ navigate  •  space toggle  •  s start all  •  x stop all  •  pgup/pgdn scroll  •  G end  •  q quit"))
 
 	return b.String()
 }

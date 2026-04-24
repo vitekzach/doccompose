@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
 )
 
@@ -83,19 +84,84 @@ func parseContainerList(data []byte) ([]containerInfo, error) {
 }
 
 // Start runs `<bin> compose up -d <service>`.
-func (c Client) Start(composePath, service string) error {
+// Always returns the full combined output for display in the log panel.
+func (c Client) Start(composePath, service string) (string, error) {
 	cmd := exec.Command(c.bin, "compose", "-f", composePath, "up", "-d", service)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%s", bytes.TrimSpace(out))
+	out, err := cmd.CombinedOutput()
+	output := string(bytes.TrimSpace(out))
+	if err != nil {
+		return output, fmt.Errorf("exit error: %w", err)
 	}
-	return nil
+	return output, nil
 }
 
 // Stop runs `<bin> compose stop <service>`.
-func (c Client) Stop(composePath, service string) error {
+// Always returns the full combined output for display in the log panel.
+func (c Client) Stop(composePath, service string) (string, error) {
 	cmd := exec.Command(c.bin, "compose", "-f", composePath, "stop", service)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("%s", bytes.TrimSpace(out))
+	out, err := cmd.CombinedOutput()
+	output := string(bytes.TrimSpace(out))
+	if err != nil {
+		return output, fmt.Errorf("exit error: %w", err)
 	}
-	return nil
+	return output, nil
+}
+
+// Down runs `<bin> compose down` to stop and remove all containers.
+// Always returns the full combined output for display in the log panel.
+func (c Client) Down(composePath string) (string, error) {
+	cmd := exec.Command(c.bin, "compose", "-f", composePath, "down")
+	out, err := cmd.CombinedOutput()
+	output := string(bytes.TrimSpace(out))
+	if err != nil {
+		return output, fmt.Errorf("exit error: %w", err)
+	}
+	return output, nil
+}
+
+// FollowLogs starts `<bin> compose logs --follow` and streams lines into the
+// returned channel. The channel is closed when the process exits. Killing the
+// process does not stop the containers because they were started detached.
+func (c Client) FollowLogs(composePath string) (<-chan string, error) {
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.Command(c.bin, "compose", "-f", composePath, "logs", "--follow", "--timestamps", "--tail", "0")
+	cmd.Stdout = pw
+	cmd.Stderr = pw
+
+	if err := cmd.Start(); err != nil {
+		pr.Close()
+		pw.Close()
+		return nil, err
+	}
+	pw.Close() // parent only reads
+
+	ch := make(chan string, 256)
+	go func() {
+		defer close(ch)
+		defer pr.Close()
+		scanner := bufio.NewScanner(pr)
+		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			ch <- scanner.Text()
+		}
+		cmd.Wait()
+	}()
+
+	return ch, nil
+}
+
+// UpAll runs `<bin> compose up -d` for all services in a single call,
+// avoiding network-creation races that occur when services are started in parallel.
+func (c Client) UpAll(composePath string) (string, error) {
+	cmd := exec.Command(c.bin, "compose", "-f", composePath, "up", "-d")
+	out, err := cmd.CombinedOutput()
+	output := string(bytes.TrimSpace(out))
+	if err != nil {
+		return output, fmt.Errorf("exit error: %w", err)
+	}
+	return output, nil
 }
