@@ -3,6 +3,7 @@ package compose
 import (
 	"fmt"
 	"os"
+	"strings"
 
 	"gopkg.in/yaml.v3"
 )
@@ -12,14 +13,65 @@ type File struct {
 }
 
 type Service struct {
-	Image       string            `yaml:"image"`
-	Build       *Build            `yaml:"build"`
-	Ports       []string          `yaml:"ports"`
-	Environment map[string]string `yaml:"environment"`
-	Volumes     []string          `yaml:"volumes"`
-	DependsOn   DependsOn         `yaml:"depends_on"`
-	Restart     string            `yaml:"restart"`
-	Command     string            `yaml:"command"`
+	Image       string      `yaml:"image"`
+	Build       *Build      `yaml:"build"`
+	Ports       []string    `yaml:"ports"`
+	Environment Environment `yaml:"environment"`
+	Volumes     []string    `yaml:"volumes"`
+	DependsOn   DependsOn   `yaml:"depends_on"`
+	Restart     string      `yaml:"restart"`
+	Command     Command     `yaml:"command"`
+}
+
+// Environment handles both map and list forms:
+//
+//	environment:
+//	  KEY: value
+//	environment:
+//	  - KEY=value
+type Environment map[string]string
+
+func (e *Environment) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.MappingNode:
+		var m map[string]string
+		if err := value.Decode(&m); err != nil {
+			return err
+		}
+		*e = m
+	case yaml.SequenceNode:
+		var list []string
+		if err := value.Decode(&list); err != nil {
+			return err
+		}
+		m := make(map[string]string, len(list))
+		for _, item := range list {
+			k, v, _ := strings.Cut(item, "=")
+			m[k] = v
+		}
+		*e = m
+	}
+	return nil
+}
+
+// Command handles both string and list forms:
+//
+//	command: "npm start"
+//	command: ["npm", "start"]
+type Command string
+
+func (c *Command) UnmarshalYAML(value *yaml.Node) error {
+	switch value.Kind {
+	case yaml.ScalarNode:
+		*c = Command(value.Value)
+	case yaml.SequenceNode:
+		var list []string
+		if err := value.Decode(&list); err != nil {
+			return err
+		}
+		*c = Command(strings.Join(list, " "))
+	}
+	return nil
 }
 
 // DependsOn handles both list and map forms of depends_on:
